@@ -47,7 +47,7 @@ DOCENTES_PDF = [
 
 # ---------------- Base de datos ----------------
 def db():
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=30)
     con.row_factory = sqlite3.Row
     return con
 
@@ -117,11 +117,14 @@ def init_db():
     """)
     if con.execute("SELECT COUNT(*) FROM materias").fetchone()[0] == 0:
         for sem, lista in PENSUM.items():
-            con.executemany("INSERT INTO materias(semestre,nombre,creditos) VALUES(?,?,?)", [(sem, n, c) for n, c in lista])
+            con.executemany("INSERT OR IGNORE INTO materias(semestre,nombre,creditos) VALUES(?,?,?)", [(sem, n, c) for n, c in lista])
     con.commit()
     con.close()
     if not q("SELECT 1 FROM usuarios WHERE rol='admin'"):
-        crear_usuario("admin", "Administrador", "admin", "admin123")
+        try:
+            crear_usuario("admin", "Administrador", "admin", "admin123")
+        except sqlite3.IntegrityError:
+            pass  # otra sesión ya lo creó
 
 
 def ahora():
@@ -542,6 +545,15 @@ def tab_estudiantes():
                 st.rerun()
 
 
+def acumular_cred(filas):
+    nuevo = pd.DataFrame(filas)
+    previo = st.session_state.get("cred")
+    if previo is not None:
+        previo = previo[~previo["Usuario"].isin(nuevo["Usuario"])]
+        nuevo = pd.concat([previo, nuevo], ignore_index=True)
+    st.session_state.cred = nuevo
+
+
 def tab_admin():
     docs = df("""SELECT u.id, u.usuario, u.nombre, (SELECT COUNT(*) FROM asignaciones a WHERE a.docente_id=u.id) AS materias
         FROM usuarios u WHERE rol='docente' ORDER BY nombre""")
@@ -564,8 +576,21 @@ def tab_admin():
                 crear_usuario(usuario, nombre, "docente", c)
                 filas.append({"Nombre": nombre, "Usuario": usuario, "Contraseña": c})
         if filas:
-            st.session_state.cred = pd.DataFrame(filas)
+            acumular_cred(filas)
         st.rerun()
+    if not docs.empty:
+        with st.expander("🔑 Restablecer contraseñas de TODOS los docentes (CSV completo)"):
+            st.warning("Esto genera una contraseña nueva para cada docente. Las anteriores dejan de funcionar.")
+            ok = st.checkbox("Entiendo, quiero restablecer todas")
+            if st.button("Restablecer todas y generar CSV", disabled=not ok):
+                filas = []
+                for _, r in docs.iterrows():
+                    c = clave_aleatoria()
+                    cambiar_clave(int(r["id"]), c)
+                    filas.append({"Nombre": r["nombre"], "Usuario": r["usuario"], "Contraseña": c})
+                st.session_state.pop("cred", None)
+                acumular_cred(filas)
+                st.rerun()
     with st.form("nuevo_doc", clear_on_submit=True):
         st.write("**Crear docente** (la contraseña se genera sola)")
         nom = st.text_input("Nombre completo")
@@ -574,7 +599,7 @@ def tab_admin():
             if nom.strip() and usu.strip() and not q("SELECT 1 FROM usuarios WHERE usuario=?", (usu.strip().lower(),)):
                 c = clave_aleatoria()
                 crear_usuario(usu, nom, "docente", c)
-                st.session_state.cred = pd.DataFrame([{"Nombre": nom, "Usuario": usu.strip().lower(), "Contraseña": c}])
+                acumular_cred([{"Nombre": nom, "Usuario": usu.strip().lower(), "Contraseña": c}])
                 st.rerun()
             st.error("Faltan datos o el usuario ya existe.")
     if not docs.empty:
@@ -584,7 +609,7 @@ def tab_admin():
         etq = etiquetas(todas)
         act = [int(x) for x in df("SELECT materia_id FROM asignaciones WHERE docente_id=?", (did,)).get("materia_id", [])]
         sel = st.multiselect("Materias asignadas", list(etq), default=act, format_func=etq.get, key=f"asig_{did}")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         if c1.button("Guardar asignación", type="primary"):
             q("DELETE FROM asignaciones WHERE docente_id=?", (did,))
             muchos("INSERT INTO asignaciones VALUES(?,?)", [(did, m) for m in sel])
@@ -593,8 +618,29 @@ def tab_admin():
             c = clave_aleatoria()
             cambiar_clave(did, c)
             u = q("SELECT usuario FROM usuarios WHERE id=?", (did,))[0]["usuario"]
-            st.session_state.cred = pd.DataFrame([{"Nombre": nombres[did], "Usuario": u, "Contraseña": c}])
+            acumular_cred([{"Nombre": nombres[did], "Usuario": u, "Contraseña": c}])
             st.rerun()
+        if c3.button("🗑️ Eliminar docente"):
+            st.session_state.conf_del = did
+        if st.session_state.get("conf_del") == did:
+            st.error(f"¿Eliminar a {nombres[did]}? Se borran su usuario y sus materias asignadas. No se puede deshacer.")
+            d1, d2 = st.columns(2)
+            if d1.button("Sí, eliminar", type="primary"):
+                u = q("SELECT usuario FROM usuarios WHERE id=?", (did,))[0]["usuario"]
+                q("DELETE FROM asignaciones WHERE docente_id=?", (did,))
+                q("DELETE FROM usuarios WHERE id=? AND rol='docente'", (did,))
+                prev = st.session_state.get("cred")
+                if prev is not None:
+                    prev = prev[prev["Usuario"] != u]
+                    if prev.empty:
+                        del st.session_state["cred"]
+                    else:
+                        st.session_state.cred = prev
+                st.session_state.pop("conf_del", None)
+                st.rerun()
+            if d2.button("Cancelar"):
+                st.session_state.pop("conf_del", None)
+                st.rerun()
     with st.expander("➕ Agregar materia al plan"):
         with st.form("nueva_mat", clear_on_submit=True):
             s = st.number_input("Semestre", 1, 9, 1)
