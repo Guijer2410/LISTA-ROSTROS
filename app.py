@@ -175,6 +175,7 @@ def init_db():
             con.execute("ALTER TABLE estudiantes ADD COLUMN foto BLOB")
     except sqlite3.OperationalError:
         pass
+    con.execute("UPDATE estudiantes SET foto=NULL WHERE foto IS NOT NULL")
     con.execute("CREATE TABLE IF NOT EXISTS sesiones(token TEXT PRIMARY KEY, usuario_id INTEGER, creado TEXT)")
     con.commit()
     con.close()
@@ -270,23 +271,6 @@ def anotar(img, caras, res):
         cv2.rectangle(im, (x, y), (x + w, y + h), color, max(2, int(esc * 2)))
         cv2.putText(im, texto, (x, max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, esc * 0.7, color, max(2, int(esc * 2)))
     return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-
-
-def miniatura(img, cara):
-    """Recorte cuadrado del rostro (96x96, JPEG) para mostrarlo en las listas."""
-    x, y, w, h = [float(v) for v in cara[:4]]
-    cx, cy, r = x + w / 2, y + h / 2, max(w, h) * 0.85
-    H, W = img.shape[:2]
-    rec = img[int(max(0, cy - r)):int(min(H, cy + r)), int(max(0, cx - r)):int(min(W, cx + r))]
-    if rec.size == 0:
-        return None
-    rec = cv2.resize(rec, (96, 96), interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", rec, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    return buf.tobytes() if ok else None
-
-
-def uri_foto(b):
-    return "data:image/jpeg;base64," + base64.b64encode(bytes(b)).decode() if isinstance(b, (bytes, bytearray)) else None
 
 
 def guardar_estudiante(codigo, nombre, sem, vecs, foto=None):
@@ -396,14 +380,9 @@ def excel_materia(mid, cid=None):
 
 
 def editor(tabla, key):
-    return st.data_editor(tabla, key=key, hide_index=True, disabled=["Foto", "codigo", "nombre"],
-                          column_config={"Foto": st.column_config.ImageColumn("Foto", width="small"), "codigo": "Código", "nombre": "Nombre",
+    return st.data_editor(tabla, key=key, hide_index=True, disabled=["codigo", "nombre"],
+                          column_config={"codigo": "Código", "nombre": "Nombre",
                                          "Presente": st.column_config.CheckboxColumn("Presente")})
-
-
-def con_foto(tabla, fotos):
-    tabla.insert(0, "Foto", [uri_foto(b) for b in fotos])
-    return tabla
 
 
 def pdf_reporte(tabla, subtitulo):
@@ -704,7 +683,7 @@ def tab_lista(usr):
     if "hora0" not in st.session_state:
         st.session_state.hora0 = ahora().time().replace(second=0, microsecond=0)
     hora = c2.time_input("Hora", st.session_state.hora0)
-    roster = df("SELECT id, codigo, nombre, foto FROM estudiantes WHERE semestre=? ORDER BY nombre", (sem,))
+    roster = df("SELECT id, codigo, nombre FROM estudiantes WHERE semestre=? ORDER BY nombre", (sem,))
     if roster.empty:
         st.warning(f"No hay estudiantes registrados en semestre {sem}. El administrador debe registrarlos primero.")
         return
@@ -738,7 +717,7 @@ def tab_lista(usr):
     if r["imgs"]:
         st.write(f"✅ Reconocidos: **{len(r['presentes'])}** · ❓ Rostros sin identificar: **{r['desconocidos']}**")
     st.caption("Revisa la lista y corrige a mano lo que haga falta antes de guardar.")
-    tabla = con_foto(roster.set_index("id")[["codigo", "nombre"]], roster["foto"])
+    tabla = roster.set_index("id")[["codigo", "nombre"]].copy()
     tabla["Presente"] = [i in r["presentes"] for i in tabla.index]
     editada = editor(tabla, f"ed_{r['n']}")
     pres = int(editada["Presente"].sum())
@@ -819,13 +798,13 @@ def tab_corregir(usr):
         return
     op = {int(r.id): f"{r.fecha} · {r.hora}" for r in cl.itertuples()}
     cid = st.selectbox("Clase", list(op), format_func=op.get)
-    act = df("""SELECT e.id, e.codigo, e.nombre, e.foto, a.presente FROM estudiantes e
+    act = df("""SELECT e.id, e.codigo, e.nombre, a.presente FROM estudiantes e
         LEFT JOIN asistencia a ON a.estudiante_id=e.id AND a.clase_id=? WHERE e.semestre=? ORDER BY e.nombre""", (int(cid), sem))
     if act.empty:
         st.info("No hay estudiantes en este semestre.")
         return
     act["presente"] = act["presente"].fillna(0).astype(int)
-    tabla = con_foto(act.set_index("id")[["codigo", "nombre"]], act["foto"])
+    tabla = act.set_index("id")[["codigo", "nombre"]].copy()
     tabla["Presente"] = act.set_index("id")["presente"].astype(bool)
     ver_ed = st.session_state.get(f"cor_v_{cid}", 0)
     editada = editor(tabla, f"cor_{cid}_{ver_ed}")
@@ -975,7 +954,7 @@ def tab_pensum():
 
 
 def tab_estudiantes():
-    est = df("SELECT codigo, nombre, semestre, foto, COALESCE(LENGTH(rostros)/512, 0) AS fotos FROM estudiantes ORDER BY semestre, nombre")
+    est = df("SELECT codigo, nombre, semestre, COALESCE(LENGTH(rostros)/512, 0) AS fotos FROM estudiantes ORDER BY semestre, nombre")
     st.metric("Estudiantes registrados", len(est))
     if not est.empty:
         buscar = st.text_input("🔎 Buscar por nombre o código", key="est_buscar")
@@ -983,7 +962,7 @@ def tab_estudiantes():
         if buscar.strip():
             b = sin_tildes(buscar.strip().lower())
             ver = est[est.nombre.map(lambda x: b in sin_tildes(x.lower())) | est.codigo.str.contains(buscar.strip(), case=False, regex=False)]
-        st.dataframe(ver.drop(columns="foto").rename(columns={"codigo": "Código", "nombre": "Nombre", "semestre": "Semestre", "fotos": "Fotos de rostro"}), hide_index=True)
+        st.dataframe(ver.rename(columns={"codigo": "Código", "nombre": "Nombre", "semestre": "Semestre", "fotos": "Fotos de rostro"}), hide_index=True)
     with st.expander("➕ Registrar estudiante o agregar fotos", expanded=est.empty):
         st.caption("Sube 2 o 3 fotos de frente, con buena luz y una sola persona. Si el código ya existe, las fotos se suman a las que ya tiene.")
         with st.form("nuevo_est", clear_on_submit=True):
@@ -992,7 +971,7 @@ def tab_estudiantes():
             sem = st.number_input("Semestre", 1, 9, 1)
             fotos = st.file_uploader("Fotos del rostro", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
             if st.form_submit_button("Guardar estudiante", type="primary"):
-                vecs, avisos, foto_b = [], [], None
+                vecs, avisos = [], []
                 for f in fotos:
                     img = leer_imagen(f)
                     caras, v = rostros(img) if img is not None else (np.zeros((0, 15)), np.zeros((0, 128)))
@@ -1003,14 +982,12 @@ def tab_estudiantes():
                         avisos.append(f"{f.name}: había {len(v)} rostros, se usó el más grande")
                     idx = int(np.argmax(caras[:, 2] * caras[:, 3]))
                     vecs.append(v[idx])
-                    if foto_b is None:
-                        foto_b = miniatura(img, caras[idx])
                 for a in avisos:
                     st.warning(a)
                 if not codigo.strip() or not nombre.strip() or not vecs:
                     st.error("Faltan datos o ninguna foto sirvió.")
                 else:
-                    guardar_estudiante(codigo.strip(), nombre.strip(), sem, vecs, foto_b)
+                    guardar_estudiante(codigo.strip(), nombre.strip(), sem, vecs)
                     avisar(f"{nombre.strip()} guardado con {len(vecs)} foto(s).")
                     st.rerun()
     if not est.empty:
