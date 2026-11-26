@@ -1,5 +1,6 @@
 import base64, calendar, datetime as dt, hashlib, html, io, os, secrets, sqlite3, unicodedata, urllib.request
 from zoneinfo import ZoneInfo
+import altair as alt
 import cv2, numpy as np, pandas as pd, streamlit as st
 import streamlit.components.v1 as components
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -418,6 +419,54 @@ def pdf_reporte(tabla, subtitulo):
     return bytes(pdf.output())
 
 
+# ---------------- Gráficas ----------------
+VERDE, AMARILLO, ROJO = "#22A06B", "#F5B400", "#E5484D"
+
+
+def grafica(ch):
+    try:
+        st.altair_chart(ch, width="stretch")
+    except TypeError:
+        st.altair_chart(ch, use_container_width=True)
+
+
+def color_pct(v):
+    return VERDE if v >= 85 else AMARILLO if v >= 70 else ROJO
+
+
+def materias_html(g):
+    filas = []
+    for r in g.sort_values("pct", ascending=False).itertuples():
+        c = color_pct(r.pct)
+        filas.append(f"<div class='mat'><div class='mat-top'><span>{html.escape(str(r.materia))}</span><b style='color:{c}'>{r.pct:.0f}%</b></div>"
+                     f"<div class='bar'><div style='width:{min(100, max(2, r.pct)):.0f}%;background:{c}'></div></div></div>")
+    return "".join(filas)
+
+
+def riesgo_html(r):
+    filas = []
+    for x in r.itertuples():
+        e = estado_faltas(x.faltas)
+        bg, fg = (("#12532f", "#c9f5da") if e == "Al día" else ("#6b4e00", "#ffe9a8") if e == "En riesgo" else ("#6b1d20", "#ffd0d2"))
+        filas.append(f"<div class='riesgo'><span>{html.escape(str(x.nombre))}</span>"
+                     f"<span class='chip' style='background:{bg};color:{fg}'>{e} · {int(x.faltas)} falta{'s' if x.faltas != 1 else ''}</span></div>")
+    return "".join(filas)
+
+
+def mapa_calor(d):
+    d = d.copy()
+    d["Clase"] = d["fecha"].str[5:] + " " + d["hora"]
+    d["Asistencia"] = np.where(d["presente"] == 1, "Presente", "Ausente")
+    orden = list(dict.fromkeys(d.sort_values(["fecha", "hora"])["Clase"]))
+    ch = alt.Chart(d).mark_rect(stroke="#0A1628", strokeWidth=2, cornerRadius=3).encode(
+        x=alt.X("Clase:O", sort=orden, title=None, axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("nombre:N", title=None, axis=alt.Axis(labelLimit=220)),
+        color=alt.Color("Asistencia:N", scale=alt.Scale(domain=["Presente", "Ausente"], range=[VERDE, ROJO]),
+                        legend=alt.Legend(orient="bottom", title=None)),
+        tooltip=[alt.Tooltip("nombre:N", title="Estudiante"), alt.Tooltip("Clase:N"), alt.Tooltip("Asistencia:N")])
+    return ch.properties(height=max(120, 26 * d["nombre"].nunique() + 70), width="container")
+
+
 # ---------------- Estilo y bienvenida ----------------
 @st.cache_data
 def escudo_uri(lado=160):
@@ -439,22 +488,59 @@ def icono_inicio_uri():
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def fecha_texto():
+    h = ahora()
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    return f"{dias[h.weekday()].capitalize()} {h.day} de {MESES[h.month - 1].lower()}"
+
+
 def estilo():
     st.markdown("""<style>
-    .block-container{padding-top:4.5rem;max-width:920px}
-    [data-testid="stMetric"]{background:#E8F0FB;border:1px solid #BFD4F0;border-radius:12px;padding:10px 14px}
-    button[role="tab"]{font-weight:600}
-    .esave-head{display:flex;align-items:center;gap:16px;background:linear-gradient(135deg,#0B2E6B,#1565C0);border-radius:16px;padding:16px 20px;margin-bottom:14px}
-    .esave-head img{height:68px}
-    .esave-head h1{margin:0;padding:0;font-size:1.8rem;color:#fff}
-    .esave-head p{margin:3px 0 0;color:#DCE9F8;font-size:.9rem}
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800&display=swap');
+    @keyframes fadein{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+    .block-container{padding-top:4.5rem;max-width:960px}
+    h1,h2,h3,h4{font-family:'Montserrat',sans-serif;letter-spacing:-.01em}
+    [data-testid="stSidebar"]{background:#0D1B33;border-right:1px solid #1E3A66}
+    [data-baseweb="tab-list"]{gap:8px;overflow-x:auto;padding-bottom:6px}
+    [data-baseweb="tab-highlight"],[data-baseweb="tab-border"]{display:none}
+    button[role="tab"]{background:#12233F;border:1px solid #1E3A66;border-radius:999px;padding:8px 16px;height:auto;font-family:'Montserrat',sans-serif;font-weight:600;transition:all .2s}
+    button[role="tab"] p{color:#B8C7E0;font-weight:600}
+    button[role="tab"]:hover{border-color:#3B82F6}
+    button[role="tab"][aria-selected="true"]{background:linear-gradient(135deg,#1D4ED8,#3B82F6);border-color:transparent;box-shadow:0 4px 14px rgba(59,130,246,.45)}
+    button[role="tab"][aria-selected="true"] p{color:#fff}
+    [data-baseweb="tab-panel"]{animation:fadein .4s}
+    [data-testid="stMetric"]{background:linear-gradient(160deg,#14284A,#0F1F3A);border:1px solid #1E3A66;border-radius:16px;padding:14px 16px;box-shadow:0 6px 18px rgba(0,0,0,.25)}
+    [data-testid="stMetricValue"]{font-family:'Montserrat',sans-serif;font-weight:700}
+    [data-testid="stForm"]{background:#12233F;border:1px solid #1E3A66;border-radius:18px;padding:18px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+    [data-testid="stExpander"]{border:1px solid #1E3A66;border-radius:14px;background:#0F1F3A}
+    [data-testid="stAlert"]{border-radius:14px}
+    .stButton>button,.stDownloadButton>button,[data-testid="stFormSubmitButton"]>button{border-radius:12px;font-weight:600;transition:transform .15s,box-shadow .15s}
+    .stButton>button:hover,.stDownloadButton>button:hover,[data-testid="stFormSubmitButton"]>button:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(59,130,246,.35)}
+    .esave-head{display:flex;align-items:center;gap:18px;background:radial-gradient(circle at 92% 0%,rgba(59,130,246,.45),transparent 45%),linear-gradient(135deg,#0B2E6B,#123C8A 60%,#1D4ED8);border:1px solid #2B4F8F;border-radius:20px;padding:18px 22px;margin-bottom:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);animation:fadein .5s}
+    .esave-head img{height:76px;filter:drop-shadow(0 4px 10px rgba(0,0,0,.45))}
+    .esave-head h1{margin:0;padding:0;font-family:'Montserrat',sans-serif;font-weight:800;font-size:1.9rem;color:#fff;letter-spacing:.02em}
+    .esave-head p{margin:4px 0 0;color:#BFD4F5;font-size:.9rem}
+    .esave-fecha{margin-left:auto;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:6px 14px;font-size:.8rem;color:#E8F0FE;white-space:nowrap}
+    @media (max-width:640px){.esave-fecha{display:none}.esave-head{padding:14px}.esave-head img{height:56px}.esave-head h1{font-size:1.3rem}}
+    .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:10px 0 16px}
+    .kpi{background:linear-gradient(160deg,#16305A,#0F2243);border:1px solid #24478A;border-radius:18px;padding:16px;box-shadow:0 8px 20px rgba(0,0,0,.28);animation:fadein .5s}
+    .kpi .ico{font-size:1.4rem}
+    .kpi .val{font-family:'Montserrat',sans-serif;font-weight:800;font-size:2rem;color:#fff;line-height:1.15}
+    .kpi .lab{color:#9DB4DB;font-size:.75rem;text-transform:uppercase;letter-spacing:.07em}
+    .kpi.alerta .val{color:#FF8A8E}
+    .mat,.riesgo{background:#0F1F3A;border:1px solid #1E3A66;border-radius:14px;padding:10px 14px;margin-bottom:8px;animation:fadein .5s}
+    .mat-top,.riesgo{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.92rem}
+    .bar{height:8px;background:#1C3157;border-radius:99px;margin-top:8px;overflow:hidden}
+    .bar div{height:100%;border-radius:99px}
+    .chip{border-radius:999px;padding:4px 12px;font-size:.8rem;font-weight:600;white-space:nowrap}
     </style>""", unsafe_allow_html=True)
 
 
 def encabezado():
     logo = f"<img src='{escudo_uri()}'>" if ESCUDO else "<span style='font-size:52px'>✈️</span>"
     st.markdown(f"<div class='esave-head'>{logo}<div><h1>{APP}</h1>"
-                "<p>Escuela de Aviación del Ejército · Asistencia con reconocimiento facial</p></div></div>", unsafe_allow_html=True)
+                "<p>Escuela de Aviación del Ejército · Asistencia con reconocimiento facial</p></div>"
+                f"<div class='esave-fecha'>📅 {fecha_texto()}</div></div>", unsafe_allow_html=True)
 
 
 def icono_pantalla_inicio():
@@ -481,17 +567,19 @@ def pantalla_login():
     estilo()
     encabezado()
     icono_pantalla_inicio()
-    st.subheader("Iniciar sesión")
-    with st.form("login"):
-        u = st.text_input("Usuario")
-        c = st.text_input("Contraseña", type="password")
-        if st.form_submit_button("Entrar", type="primary"):
-            usr = verificar(u, c)
-            if usr:
-                st.session_state.usr = usr
-                st.rerun()
-            st.error("Usuario o contraseña incorrectos")
-    st.caption("¿Olvidaste tu contraseña? Pídele una nueva al administrador.")
+    _, centro, _ = st.columns([1, 2, 1])
+    with centro:
+        st.subheader("Iniciar sesión")
+        with st.form("login"):
+            u = st.text_input("Usuario")
+            c = st.text_input("Contraseña", type="password")
+            if st.form_submit_button("Entrar", type="primary"):
+                usr = verificar(u, c)
+                if usr:
+                    st.session_state.usr = usr
+                    st.rerun()
+                st.error("Usuario o contraseña incorrectos")
+        st.caption("¿Olvidaste tu contraseña? Pídele una nueva al administrador.")
 
 
 def tab_inicio(usr):
@@ -518,18 +606,18 @@ def tab_inicio(usr):
     f = faltas_df(mids)
     pct = f"{100 * f.asistencias.sum() / f.clases.sum():.1f}%" if not f.empty else "—"
     riesgo = int(f[f.faltas > MAX_FALTAS].codigo.nunique()) if not f.empty else 0
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Estudiantes", int(n_est))
-    m2.metric("Listas tomadas", int(n_cl))
-    m3.metric("Asistencia", pct)
-    m4.metric("En alerta", riesgo)
+    tiles = [("👥", int(n_est), "Estudiantes", ""), ("📋", int(n_cl), "Listas tomadas", ""), ("📈", pct, "Asistencia general", ""),
+             ("🚨", riesgo, "En alerta", " alerta" if riesgo else "")]
+    st.markdown("<div class='kpis'>" + "".join(f"<div class='kpi{c}'><div class='ico'>{i}</div><div class='val'>{v}</div><div class='lab'>{l}</div></div>"
+                                                for i, v, l, c in tiles) + "</div>", unsafe_allow_html=True)
     for a in alertas(mids):
         st.error(a)
     if not f.empty:
         g = f.groupby("materia")[["asistencias", "clases"]].sum()
-        g["% asistencia"] = (100 * g.asistencias / g.clases).round(1)
-        st.write("**Asistencia por materia (%)**")
-        st.bar_chart(g["% asistencia"])
+        g["pct"] = (100 * g.asistencias / g.clases).round(1)
+        st.markdown("### Asistencia por materia")
+        st.markdown(materias_html(g.reset_index()), unsafe_allow_html=True)
+        st.caption("🟢 85% o más · 🟡 70% a 84% · 🔴 menos de 70%")
     else:
         st.caption("Cuando guardes la primera lista, aquí verás las estadísticas.")
     if usr["rol"] == "admin":
@@ -688,7 +776,7 @@ def tab_corregir(usr):
 def semaforo(tabla):
     def color(fila):
         n = fila["Faltas"]
-        c = "background-color:#C8E6C9;color:#1B5E20" if n <= 1 else "background-color:#FFF3C4;color:#7A5200" if n <= MAX_FALTAS else "background-color:#F8C9C9;color:#8B1A1A"
+        c = "background-color:#12532f;color:#c9f5da" if n <= 1 else "background-color:#6b4e00;color:#ffe9a8" if n <= MAX_FALTAS else "background-color:#6b1d20;color:#ffd0d2"
         return [c] * len(fila)
     return tabla.style.apply(color, axis=1, subset=["Faltas", "Estado"])
 
@@ -737,7 +825,35 @@ def tab_reportes(usr):
     except Exception:
         st.dataframe(tabla, hide_index=True)
     st.caption(f"🟢 0 a 1 faltas · 🟡 2 a {MAX_FALTAS} faltas · 🔴 más de {MAX_FALTAS} faltas")
-    st.bar_chart(f.groupby("nombre")["faltas"].sum())
+    st.subheader("Estudiantes con más faltas")
+    r = f.groupby("nombre", as_index=False)["faltas"].sum().sort_values("faltas", ascending=False).head(10)
+    r = r[r["faltas"] > 0]
+    if r.empty:
+        st.success("Nadie tiene faltas en este periodo.")
+    else:
+        st.markdown(riesgo_html(r), unsafe_allow_html=True)
+    st.subheader("Mapa de calor de asistencia")
+    if sel == 0:
+        st.caption("Elige una materia para ver el mapa de calor.")
+    else:
+        cond, args = "", [int(sel)]
+        if desde:
+            cond += " AND c.fecha>=?"
+            args.append(str(desde))
+        if hasta:
+            cond += " AND c.fecha<=?"
+            args.append(str(hasta))
+        d = df(f"""SELECT e.nombre, e.codigo, c.fecha, c.hora, a.presente FROM asistencia a
+            JOIN clases c ON c.id=a.clase_id JOIN estudiantes e ON e.id=a.estudiante_id
+            WHERE c.materia_id=?{cond}""", tuple(args))
+        d = d[d["codigo"].isin(f["codigo"])] if not d.empty else d
+        if d.empty:
+            st.caption("Todavía no hay datos para el mapa.")
+        else:
+            try:
+                grafica(mapa_calor(d))
+            except Exception as e:
+                st.caption(f"No se pudo dibujar el mapa: {e}")
     with st.expander("🔎 Historial de un estudiante"):
         nombres = dict(zip(f.codigo, f.nombre))
         cod = st.selectbox("Estudiante", list(nombres), format_func=lambda c: f"{nombres[c]} ({c})", key="rep_hist")
