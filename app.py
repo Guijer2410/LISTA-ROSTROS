@@ -7,8 +7,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from PIL import Image, ImageFilter
 
 APP = "ESAVE Checklist"
-FONDO = next((p for p in ("fondo.jpg", "fondo.jpeg", "fondo.png", "assets/fondo.jpg") if os.path.exists(p)), None)
-FONDO_MOVIL = next((p for p in ("fondo_movil.jpg", "assets/fondo_movil.jpg") if os.path.exists(p)), None)
+FONDO = next((p for p in ("fondo.svg", "assets/fondo.svg", "fondo.jpg", "fondo.jpeg", "fondo.png", "assets/fondo.jpg") if os.path.exists(p)), None)
+FONDO_MOVIL = next((p for p in ("fondo_movil.svg", "assets/fondo_movil.svg", "fondo_movil.jpg", "assets/fondo_movil.jpg") if os.path.exists(p)), None)
 ESCUDO = next((p for p in ("escudo.png", "escudo.jpg", "escudo.jpeg", "assets/escudo.png") if os.path.exists(p)), None)
 try:
     _icono = Image.open(ESCUDO) if ESCUDO else "✈️"
@@ -526,7 +526,10 @@ def icono_inicio_uri():
 
 @st.cache_data
 def fondo_uri(ruta):
-    """Foto de fondo del login, desenfocada aquí mismo (sirve con cualquier imagen que pongas)."""
+    """Fondo del login. Si es SVG (animado) se usa tal cual; si es foto, se desenfoca aquí mismo."""
+    if ruta.lower().endswith(".svg"):
+        with open(ruta, "rb") as f:
+            return "data:image/svg+xml;base64," + base64.b64encode(f.read()).decode()
     im = Image.open(ruta).convert("RGB")
     im.thumbnail((1280, 1280))
     im = im.filter(ImageFilter.GaussianBlur(5))
@@ -538,7 +541,8 @@ def fondo_uri(ruta):
 def fondo_login():
     if not FONDO:
         return
-    capa = "linear-gradient(rgba(8,20,45,.45),rgba(8,20,45,.68))"
+    capa = ("linear-gradient(rgba(8,20,45,.12),rgba(8,20,45,.32))" if FONDO.lower().endswith(".svg")
+            else "linear-gradient(rgba(8,20,45,.45),rgba(8,20,45,.68))")
     movil = (f"@media (max-aspect-ratio:1/1){{.stApp,[data-testid=\"stApp\"]{{background:{capa},url(\"{fondo_uri(FONDO_MOVIL)}\") center/cover no-repeat !important}}}}"
              if FONDO_MOVIL else "")
     st.markdown(f"""<style>
