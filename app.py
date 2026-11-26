@@ -114,6 +114,39 @@ def verificar(usuario, clave):
     return None
 
 
+DIAS_SESION = 7
+
+
+def crear_sesion(uid):
+    token = secrets.token_urlsafe(24)
+    q("INSERT INTO sesiones(token,usuario_id,creado) VALUES(?,?,?)", (token, int(uid), ahora().isoformat()))
+    return token
+
+
+def usuario_de_sesion(token):
+    if not token:
+        return None
+    limite = (ahora() - dt.timedelta(days=DIAS_SESION)).isoformat()
+    f = q("SELECT u.* FROM sesiones s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=? AND s.creado>=?", (str(token), limite))
+    return dict(f[0]) if f else None
+
+
+def cerrar_sesion(token):
+    if token:
+        q("DELETE FROM sesiones WHERE token=?", (str(token),))
+
+
+def avisar(msg, icono="✅"):
+    """Deja un aviso que se muestra (como notificación) justo después de refrescar la pantalla."""
+    st.session_state.toast = (msg, icono)
+
+
+def mostrar_aviso():
+    t = st.session_state.pop("toast", None)
+    if t:
+        st.toast(t[0], icon=t[1])
+
+
 def clave_admin_inicial():
     """Clave inicial del admin: viene de los Secrets de Streamlit (ADMIN_PASSWORD) o, si no hay, de un valor por defecto."""
     try:
@@ -140,6 +173,7 @@ def init_db():
             con.execute("ALTER TABLE estudiantes ADD COLUMN foto BLOB")
     except sqlite3.OperationalError:
         pass
+    con.execute("CREATE TABLE IF NOT EXISTS sesiones(token TEXT PRIMARY KEY, usuario_id INTEGER, creado TEXT)")
     con.commit()
     con.close()
     if not q("SELECT 1 FROM usuarios WHERE rol='admin'"):
@@ -567,6 +601,7 @@ def pantalla_login():
     estilo()
     encabezado()
     icono_pantalla_inicio()
+    mostrar_aviso()
     _, centro, _ = st.columns([1, 2, 1])
     with centro:
         st.subheader("Iniciar sesión")
@@ -577,6 +612,7 @@ def pantalla_login():
                 usr = verificar(u, c)
                 if usr:
                     st.session_state.usr = usr
+                    st.query_params["s"] = crear_sesion(usr["id"])
                     st.rerun()
                 st.error("Usuario o contraseña incorrectos")
         st.caption("¿Olvidaste tu contraseña? Pídele una nueva al administrador.")
@@ -689,10 +725,9 @@ def tab_lista(usr):
             filas.append((cid, int(eid), int(bool(pres)), metodo))
         muchos("INSERT OR REPLACE INTO asistencia(clase_id,estudiante_id,presente,metodo) VALUES(?,?,?,?)", filas)
         total = sum(f[2] for f in filas)
-        st.success(f"Asistencia guardada: {total} presentes, {len(filas) - total} ausentes.")
-        for a in alertas([mid]):
-            st.error(a)
-        del st.session_state["reco"]
+        avisar(f"Asistencia guardada: {total} presentes, {len(filas) - total} ausentes.")
+        st.session_state.pop("reco", None)
+        st.rerun()
 
 
 def tab_calendario(usr):
@@ -761,16 +796,36 @@ def tab_corregir(usr):
     act["presente"] = act["presente"].fillna(0).astype(int)
     tabla = con_foto(act.set_index("id")[["codigo", "nombre"]], act["foto"])
     tabla["Presente"] = act.set_index("id")["presente"].astype(bool)
-    editada = editor(tabla, f"cor_{cid}")
+    ver_ed = st.session_state.get(f"cor_v_{cid}", 0)
+    editada = editor(tabla, f"cor_{cid}_{ver_ed}")
     if st.button("💾 Guardar correcciones", type="primary"):
         for eid, pres in editada["Presente"].items():
             if bool(pres) != bool(tabla.loc[eid, "Presente"]):
                 q("INSERT OR REPLACE INTO asistencia VALUES(?,?,?,?)", (int(cid), int(eid), int(bool(pres)), "manual"))
             else:
                 q("INSERT OR IGNORE INTO asistencia VALUES(?,?,?,?)", (int(cid), int(eid), int(bool(pres)), "auto"))
-        st.success("Correcciones guardadas.")
-        for a in alertas([mid]):
-            st.error(a)
+        st.session_state[f"cor_v_{cid}"] = ver_ed + 1
+        avisar("Correcciones guardadas.")
+        st.rerun()
+    # --- eliminar la asistencia de esta clase ---
+    with st.expander("🗑️ Eliminar la asistencia de esta clase"):
+        st.caption("Borra los presentes y ausentes guardados de esta clase. Después puedes volver a tomar lista.")
+        tambien = st.checkbox("Eliminar también la clase del calendario", key=f"del_cal_{cid}")
+        if st.button("Eliminar asistencia de esta clase", key=f"del_as_{cid}"):
+            st.session_state.conf_clase = int(cid)
+        if st.session_state.get("conf_clase") == int(cid):
+            st.error(f"¿Eliminar la asistencia del {op[cid]}? No se puede deshacer.")
+            d1, d2 = st.columns(2)
+            if d1.button("Sí, eliminar", type="primary", key=f"si_as_{cid}"):
+                q("DELETE FROM asistencia WHERE clase_id=?", (int(cid),))
+                if tambien:
+                    q("DELETE FROM clases WHERE id=?", (int(cid),))
+                st.session_state.pop("conf_clase", None)
+                avisar("Asistencia eliminada." + (" La clase también salió del calendario." if tambien else ""), "🗑️")
+                st.rerun()
+            if d2.button("Cancelar", key=f"no_as_{cid}"):
+                st.session_state.pop("conf_clase", None)
+                st.rerun()
 
 
 def semaforo(tabla):
@@ -932,7 +987,8 @@ def tab_estudiantes():
                     st.error("Faltan datos o ninguna foto sirvió.")
                 else:
                     guardar_estudiante(codigo.strip(), nombre.strip(), sem, vecs, foto_b)
-                    st.success(f"{nombre} guardado con {len(vecs)} foto(s).")
+                    avisar(f"{nombre.strip()} guardado con {len(vecs)} foto(s).")
+                    st.rerun()
     if not est.empty:
         with st.expander("🗑️ Eliminar estudiante"):
             cod = st.selectbox("Estudiante", est.codigo, format_func=lambda c: f"{c} · {est.set_index('codigo').nombre[c]}")
@@ -940,6 +996,7 @@ def tab_estudiantes():
                 e = q("SELECT id FROM estudiantes WHERE codigo=?", (cod,))[0]["id"]
                 q("DELETE FROM asistencia WHERE estudiante_id=?", (e,))
                 q("DELETE FROM estudiantes WHERE id=?", (e,))
+                avisar("Estudiante eliminado.", "🗑️")
                 st.rerun()
 
 
@@ -1011,7 +1068,8 @@ def tab_admin():
         if c1.button("Guardar asignación", type="primary"):
             q("DELETE FROM asignaciones WHERE docente_id=?", (did,))
             muchos("INSERT INTO asignaciones VALUES(?,?)", [(did, m) for m in sel])
-            st.success("Asignación guardada.")
+            avisar("Asignación guardada.")
+            st.rerun()
         if c2.button("Nueva contraseña"):
             c = clave_aleatoria()
             cambiar_clave(did, c)
@@ -1026,6 +1084,7 @@ def tab_admin():
             if d1.button("Sí, eliminar", type="primary"):
                 u = q("SELECT usuario FROM usuarios WHERE id=?", (did,))[0]["usuario"]
                 q("DELETE FROM asignaciones WHERE docente_id=?", (did,))
+                q("DELETE FROM sesiones WHERE usuario_id=?", (did,))
                 q("DELETE FROM usuarios WHERE id=? AND rol='docente'", (did,))
                 prev = st.session_state.get("cred")
                 if prev is not None:
@@ -1035,6 +1094,7 @@ def tab_admin():
                     else:
                         st.session_state.cred = prev
                 st.session_state.pop("conf_del", None)
+                avisar("Docente eliminado.", "🗑️")
                 st.rerun()
             if d2.button("Cancelar"):
                 st.session_state.pop("conf_del", None)
@@ -1046,7 +1106,8 @@ def tab_admin():
             cr = st.number_input("Créditos", 1, 6, 3)
             if st.form_submit_button("Agregar") and n.strip():
                 q("INSERT OR IGNORE INTO materias(semestre,nombre,creditos) VALUES(?,?,?)", (int(s), n.strip(), int(cr)))
-                st.success("Materia agregada.")
+                avisar("Materia agregada.")
+                st.rerun()
     with st.expander("💾 Respaldo de datos"):
         st.caption("Descarga una copia de vez en cuando; sirve para restaurar si el servidor se reinicia.")
         with open(DB, "rb") as fh:
@@ -1055,14 +1116,21 @@ def tab_admin():
         if sub and st.button("Restaurar copia"):
             with open(DB, "wb") as fh:
                 fh.write(sub.getvalue())
-            st.success("Restaurada. Recarga la página.")
+            st.session_state.clear()
+            st.query_params.clear()
+            avisar("Copia restaurada. Inicia sesión de nuevo.")
+            st.rerun()
 
 
 # ---------------- Principal ----------------
 init_db()
 if "usr" not in st.session_state:
-    pantalla_login()
-    st.stop()
+    u_ses = usuario_de_sesion(st.query_params.get("s"))
+    if u_ses:
+        st.session_state.usr = u_ses
+    else:
+        pantalla_login()
+        st.stop()
 usr = st.session_state.usr
 es_admin = usr["rol"] == "admin"
 with st.sidebar:
@@ -1077,11 +1145,14 @@ with st.sidebar:
         else:
             st.error("Mínimo 6 caracteres.")
     if st.button("Cerrar sesión"):
+        cerrar_sesion(st.query_params.get("s"))
+        st.query_params.clear()
         st.session_state.clear()
         st.rerun()
 estilo()
 encabezado()
 icono_pantalla_inicio()
+mostrar_aviso()
 mids = list(etiquetas(mis_materias(usr)))
 avisos = alertas(mids)
 if avisos:
