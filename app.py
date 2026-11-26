@@ -441,7 +441,7 @@ def icono_inicio_uri():
 
 def estilo():
     st.markdown("""<style>
-    .block-container{padding-top:1.2rem;max-width:920px}
+    .block-container{padding-top:4.5rem;max-width:920px}
     [data-testid="stMetric"]{background:#E8F0FB;border:1px solid #BFD4F0;border-radius:12px;padding:10px 14px}
     button[role="tab"]{font-weight:600}
     .esave-head{display:flex;align-items:center;gap:16px;background:linear-gradient(135deg,#0B2E6B,#1565C0);border-radius:16px;padding:16px 20px;margin-bottom:14px}
