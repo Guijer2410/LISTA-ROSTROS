@@ -8,6 +8,7 @@ from PIL import Image, ImageFilter
 
 APP = "ESAVE Checklist"
 FONDO = next((p for p in ("fondo.jpg", "fondo.jpeg", "fondo.png", "assets/fondo.jpg") if os.path.exists(p)), None)
+FONDO_MOVIL = next((p for p in ("fondo_movil.jpg", "assets/fondo_movil.jpg") if os.path.exists(p)), None)
 ESCUDO = next((p for p in ("escudo.png", "escudo.jpg", "escudo.jpeg", "assets/escudo.png") if os.path.exists(p)), None)
 try:
     _icono = Image.open(ESCUDO) if ESCUDO else "✈️"
@@ -524,9 +525,9 @@ def icono_inicio_uri():
 
 
 @st.cache_data
-def fondo_uri():
-    """Foto de fondo del login, desenfocada aquí mismo (sirve con cualquier imagen que pongas en fondo.jpg)."""
-    im = Image.open(FONDO).convert("RGB")
+def fondo_uri(ruta):
+    """Foto de fondo del login, desenfocada aquí mismo (sirve con cualquier imagen que pongas)."""
+    im = Image.open(ruta).convert("RGB")
     im.thumbnail((1280, 1280))
     im = im.filter(ImageFilter.GaussianBlur(5))
     buf = io.BytesIO()
@@ -537,8 +538,12 @@ def fondo_uri():
 def fondo_login():
     if not FONDO:
         return
+    capa = "linear-gradient(rgba(8,20,45,.45),rgba(8,20,45,.68))"
+    movil = (f"@media (max-aspect-ratio:1/1){{.stApp,[data-testid=\"stApp\"]{{background:{capa},url(\"{fondo_uri(FONDO_MOVIL)}\") center/cover no-repeat !important}}}}"
+             if FONDO_MOVIL else "")
     st.markdown(f"""<style>
-    .stApp,[data-testid="stApp"]{{background:linear-gradient(rgba(8,20,45,.45),rgba(8,20,45,.68)),url("{fondo_uri()}") center/cover fixed no-repeat !important}}
+    .stApp,[data-testid="stApp"]{{background:{capa},url("{fondo_uri(FONDO)}") center/cover no-repeat !important}}
+    {movil}
     [data-testid="stForm"]{{background:rgba(14,30,58,.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.18);box-shadow:0 12px 40px rgba(0,0,0,.4)}}
     </style>""", unsafe_allow_html=True)
 
@@ -594,7 +599,7 @@ def estilo():
 def encabezado():
     logo = f"<img src='{escudo_uri()}'>" if ESCUDO else "<span style='font-size:52px'>✈️</span>"
     st.markdown(f"<div class='esave-head'>{logo}<div><h1>{APP}</h1>"
-                "<p>Escuela de Aviación del Ejército · Asistencia con reconocimiento facial</p></div>"
+                "<p>Escuela de Aviación del Ejército</p></div>"
                 f"<div class='esave-fecha'>📅 {fecha_texto()}</div></div>", unsafe_allow_html=True)
 
 
