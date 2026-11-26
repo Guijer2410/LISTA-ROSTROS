@@ -1,9 +1,17 @@
-import calendar, datetime as dt, hashlib, html, io, os, secrets, sqlite3, unicodedata, urllib.request
+import base64, calendar, datetime as dt, hashlib, html, io, os, secrets, sqlite3, unicodedata, urllib.request
 from zoneinfo import ZoneInfo
 import cv2, numpy as np, pandas as pd, streamlit as st
-from openpyxl.styles import PatternFill
+import streamlit.components.v1 as components
+from openpyxl.styles import Alignment, Font, PatternFill
+from PIL import Image
 
-st.set_page_config(page_title="Lista con rostro", page_icon="✈️")
+APP = "ESAVE Checklist"
+ESCUDO = next((p for p in ("escudo.png", "escudo.jpg", "escudo.jpeg", "assets/escudo.png") if os.path.exists(p)), None)
+try:
+    _icono = Image.open(ESCUDO) if ESCUDO else "✈️"
+except Exception:
+    _icono = "✈️"
+st.set_page_config(page_title=APP, page_icon=_icono)
 DB = "asistencia.db"
 MAX_FALTAS = 3
 MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
@@ -105,24 +113,37 @@ def verificar(usuario, clave):
     return None
 
 
+def clave_admin_inicial():
+    """Clave inicial del admin: viene de los Secrets de Streamlit (ADMIN_PASSWORD) o, si no hay, de un valor por defecto."""
+    try:
+        return str(st.secrets["ADMIN_PASSWORD"])
+    except Exception:
+        return "admin123"
+
+
 def init_db():
     con = db()
     con.executescript("""
     CREATE TABLE IF NOT EXISTS usuarios(id INTEGER PRIMARY KEY, usuario TEXT UNIQUE, nombre TEXT, rol TEXT, sal TEXT, clave TEXT);
     CREATE TABLE IF NOT EXISTS materias(id INTEGER PRIMARY KEY, semestre INTEGER, nombre TEXT, creditos INTEGER, UNIQUE(semestre,nombre));
     CREATE TABLE IF NOT EXISTS asignaciones(docente_id INTEGER, materia_id INTEGER, PRIMARY KEY(docente_id,materia_id));
-    CREATE TABLE IF NOT EXISTS estudiantes(id INTEGER PRIMARY KEY, codigo TEXT UNIQUE, nombre TEXT, semestre INTEGER, rostros BLOB);
+    CREATE TABLE IF NOT EXISTS estudiantes(id INTEGER PRIMARY KEY, codigo TEXT UNIQUE, nombre TEXT, semestre INTEGER, rostros BLOB, foto BLOB);
     CREATE TABLE IF NOT EXISTS clases(id INTEGER PRIMARY KEY, materia_id INTEGER, docente_id INTEGER, fecha TEXT, hora TEXT, UNIQUE(materia_id,fecha,hora));
     CREATE TABLE IF NOT EXISTS asistencia(clase_id INTEGER, estudiante_id INTEGER, presente INTEGER, metodo TEXT, PRIMARY KEY(clase_id,estudiante_id));
     """)
     if con.execute("SELECT COUNT(*) FROM materias").fetchone()[0] == 0:
         for sem, lista in PENSUM.items():
             con.executemany("INSERT OR IGNORE INTO materias(semestre,nombre,creditos) VALUES(?,?,?)", [(sem, n, c) for n, c in lista])
+    try:
+        if "foto" not in [r[1] for r in con.execute("PRAGMA table_info(estudiantes)")]:
+            con.execute("ALTER TABLE estudiantes ADD COLUMN foto BLOB")
+    except sqlite3.OperationalError:
+        pass
     con.commit()
     con.close()
     if not q("SELECT 1 FROM usuarios WHERE rol='admin'"):
         try:
-            crear_usuario("admin", "Administrador", "admin", "admin123")
+            crear_usuario("admin", "Administrador", "admin", clave_admin_inicial())
         except sqlite3.IntegrityError:
             pass  # otra sesión ya lo creó
 
@@ -214,15 +235,32 @@ def anotar(img, caras, res):
     return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
 
 
-def guardar_estudiante(codigo, nombre, sem, vecs):
+def miniatura(img, cara):
+    """Recorte cuadrado del rostro (96x96, JPEG) para mostrarlo en las listas."""
+    x, y, w, h = [float(v) for v in cara[:4]]
+    cx, cy, r = x + w / 2, y + h / 2, max(w, h) * 0.85
+    H, W = img.shape[:2]
+    rec = img[int(max(0, cy - r)):int(min(H, cy + r)), int(max(0, cx - r)):int(min(W, cx + r))]
+    if rec.size == 0:
+        return None
+    rec = cv2.resize(rec, (96, 96), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", rec, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return buf.tobytes() if ok else None
+
+
+def uri_foto(b):
+    return "data:image/jpeg;base64," + base64.b64encode(bytes(b)).decode() if isinstance(b, (bytes, bytearray)) else None
+
+
+def guardar_estudiante(codigo, nombre, sem, vecs, foto=None):
     nuevo = np.array(vecs, np.float32)
     ex = q("SELECT id, rostros FROM estudiantes WHERE codigo=?", (codigo,))
     if ex:
         previos = np.frombuffer(ex[0]["rostros"], np.float32).reshape(-1, 128) if ex[0]["rostros"] else np.zeros((0, 128), np.float32)
         todo = np.vstack([previos, nuevo])[-8:]
-        q("UPDATE estudiantes SET nombre=?, semestre=?, rostros=? WHERE id=?", (nombre, int(sem), todo.tobytes(), ex[0]["id"]))
+        q("UPDATE estudiantes SET nombre=?, semestre=?, rostros=?, foto=COALESCE(?, foto) WHERE id=?", (nombre, int(sem), todo.tobytes(), foto, ex[0]["id"]))
     else:
-        q("INSERT INTO estudiantes(codigo,nombre,semestre,rostros) VALUES(?,?,?,?)", (codigo, nombre, int(sem), nuevo.tobytes()))
+        q("INSERT INTO estudiantes(codigo,nombre,semestre,rostros,foto) VALUES(?,?,?,?,?)", (codigo, nombre, int(sem), nuevo.tobytes(), foto))
 
 
 # ---------------- Lógica de asistencia ----------------
@@ -241,14 +279,25 @@ def obtener_clase(mid, did, fecha, hora):
     return q("SELECT id FROM clases WHERE materia_id=? AND fecha=? AND hora=?", (int(mid), fecha, hora))[0]["id"]
 
 
-def faltas_df(mids):
+def faltas_df(mids, desde=None, hasta=None):
     if not mids:
         return pd.DataFrame()
+    cond, args = "", list(mids)
+    if desde:
+        cond += " AND c.fecha>=?"
+        args.append(str(desde))
+    if hasta:
+        cond += " AND c.fecha<=?"
+        args.append(str(hasta))
     return df(f"""SELECT e.codigo, e.nombre, m.nombre AS materia, COUNT(*) AS clases,
         SUM(a.presente) AS asistencias, SUM(1 - a.presente) AS faltas
         FROM asistencia a JOIN estudiantes e ON e.id=a.estudiante_id JOIN clases c ON c.id=a.clase_id
-        JOIN materias m ON m.id=c.materia_id WHERE m.id IN ({marcas(mids)})
-        GROUP BY e.id, m.id ORDER BY faltas DESC, e.nombre""", tuple(mids))
+        JOIN materias m ON m.id=c.materia_id WHERE m.id IN ({marcas(mids)}){cond}
+        GROUP BY e.id, m.id ORDER BY faltas DESC, e.nombre""", tuple(args))
+
+
+def estado_faltas(n):
+    return "Al día" if n <= 1 else "En riesgo" if n <= MAX_FALTAS else "Alerta"
 
 
 def alertas(mids):
@@ -288,24 +337,151 @@ def excel_materia(mid, cid=None):
         res.to_excel(w, sheet_name="Resumen", index=False)
         for hoja in ("Asistencia", "Resumen"):
             ws = w.sheets[hoja]
-            ws.column_dimensions["B"].width = 38
+            ws.freeze_panes = "C2"
+            for c in ws[1]:
+                c.fill = PatternFill("solid", fgColor="0B3D91")
+                c.font = Font(bold=True, color="FFFFFF")
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = 14 if col[0].column_letter == "A" else 38 if col[0].column_letter == "B" else 17
             for fila in ws.iter_rows(min_row=2):
                 for c in fila:
                     if c.value == "Ausente":
                         c.fill = PatternFill("solid", fgColor="F8B4B4")
                     elif c.value == "Presente":
                         c.fill = PatternFill("solid", fgColor="B7E4C7")
+        ws = w.sheets["Resumen"]
+        i = list(res.columns).index("Faltas")
+        for fila in ws.iter_rows(min_row=2):
+            n = fila[i].value or 0
+            fila[i].fill = PatternFill("solid", fgColor="B7E4C7" if n <= 1 else "FFF3B0" if n <= MAX_FALTAS else "F8B4B4")
     return buf.getvalue()
 
 
 def editor(tabla, key):
-    return st.data_editor(tabla, key=key, hide_index=True, disabled=["codigo", "nombre"],
-                          column_config={"codigo": "Código", "nombre": "Nombre", "Presente": st.column_config.CheckboxColumn("Presente")})
+    return st.data_editor(tabla, key=key, hide_index=True, disabled=["Foto", "codigo", "nombre"],
+                          column_config={"Foto": st.column_config.ImageColumn("Foto", width="small"), "codigo": "Código", "nombre": "Nombre",
+                                         "Presente": st.column_config.CheckboxColumn("Presente")})
+
+
+def con_foto(tabla, fotos):
+    tabla.insert(0, "Foto", [uri_foto(b) for b in fotos])
+    return tabla
+
+
+def pdf_reporte(tabla, subtitulo):
+    from fpdf import FPDF
+
+    def t(x):
+        return str(x).encode("latin-1", "replace").decode("latin-1")
+
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(False)
+    pdf.add_page()
+    x0 = 10
+    if ESCUDO:
+        try:
+            pdf.image(ESCUDO, x=10, y=8, h=18)
+            x0 = 32
+        except Exception:
+            pass
+    pdf.set_xy(x0, 9)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 8, t("ESAVE Checklist - Reporte de faltas"))
+    pdf.set_xy(x0, 17)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, t(f"{subtitulo} - Generado: {ahora():%Y-%m-%d %H:%M}"))
+    anchos = [24, 66, 70, 17, 24, 17, 24, 35]
+
+    def encabezado_tabla():
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(11, 61, 145)
+        pdf.set_text_color(255, 255, 255)
+        for ancho, nombre in zip(anchos, tabla.columns):
+            pdf.cell(ancho, 8, t(nombre), border=1, fill=True, align="C")
+        pdf.ln()
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 9)
+
+    pdf.set_y(30)
+    encabezado_tabla()
+    for fila in tabla.itertuples(index=False):
+        if pdf.get_y() > 192:
+            pdf.add_page()
+            pdf.set_y(12)
+            encabezado_tabla()
+        faltas = int(fila[5])
+        pdf.set_fill_color(*((200, 230, 201) if faltas <= 1 else (255, 243, 196) if faltas <= MAX_FALTAS else (248, 201, 201)))
+        for ancho, valor in zip(anchos, fila):
+            pdf.cell(ancho, 7, t(valor)[:int(ancho / 1.9)], border=1, fill=True)
+        pdf.ln()
+    return bytes(pdf.output())
+
+
+# ---------------- Estilo y bienvenida ----------------
+@st.cache_data
+def escudo_uri(lado=160):
+    im = Image.open(ESCUDO).convert("RGBA")
+    im.thumbnail((lado, lado))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+@st.cache_data
+def icono_inicio_uri():
+    im = Image.open(ESCUDO).convert("RGBA")
+    im.thumbnail((150, 150))
+    lienzo = Image.new("RGBA", (180, 180), (255, 255, 255, 255))
+    lienzo.paste(im, ((180 - im.width) // 2, (180 - im.height) // 2), im)
+    buf = io.BytesIO()
+    lienzo.convert("RGB").save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def estilo():
+    st.markdown("""<style>
+    .block-container{padding-top:1.2rem;max-width:920px}
+    [data-testid="stMetric"]{background:#E8F0FB;border:1px solid #BFD4F0;border-radius:12px;padding:10px 14px}
+    button[role="tab"]{font-weight:600}
+    .esave-head{display:flex;align-items:center;gap:16px;background:linear-gradient(135deg,#0B2E6B,#1565C0);border-radius:16px;padding:16px 20px;margin-bottom:14px}
+    .esave-head img{height:68px}
+    .esave-head h1{margin:0;padding:0;font-size:1.8rem;color:#fff}
+    .esave-head p{margin:3px 0 0;color:#DCE9F8;font-size:.9rem}
+    </style>""", unsafe_allow_html=True)
+
+
+def encabezado():
+    logo = f"<img src='{escudo_uri()}'>" if ESCUDO else "<span style='font-size:52px'>✈️</span>"
+    st.markdown(f"<div class='esave-head'>{logo}<div><h1>{APP}</h1>"
+                "<p>Escuela de Aviación del Ejército · Asistencia con reconocimiento facial</p></div></div>", unsafe_allow_html=True)
+
+
+def icono_pantalla_inicio():
+    """Pone el escudo como ícono al usar 'Añadir a pantalla de inicio' (mejor esfuerzo)."""
+    if not ESCUDO:
+        return
+    components.html(f"""<script>
+    for (const w of [window.parent, window.top]) {{
+      try {{
+        const d = w.document;
+        let l = d.querySelector("link[rel='apple-touch-icon']");
+        if (!l) {{ l = d.createElement('link'); l.rel = 'apple-touch-icon'; d.head.appendChild(l); }}
+        l.href = "{icono_inicio_uri()}";
+        let m = d.querySelector("meta[name='apple-mobile-web-app-title']");
+        if (!m) {{ m = d.createElement('meta'); m.name = 'apple-mobile-web-app-title'; d.head.appendChild(m); }}
+        m.content = "{APP}";
+      }} catch (e) {{}}
+    }}
+    </script>""", height=0)
 
 
 # ---------------- Pantallas ----------------
 def pantalla_login():
-    st.title("✈️ Lista con reconocimiento facial")
+    estilo()
+    encabezado()
+    icono_pantalla_inicio()
+    st.subheader("Iniciar sesión")
     with st.form("login"):
         u = st.text_input("Usuario")
         c = st.text_input("Contraseña", type="password")
@@ -315,8 +491,49 @@ def pantalla_login():
                 st.session_state.usr = usr
                 st.rerun()
             st.error("Usuario o contraseña incorrectos")
-    if verificar("admin", "admin123"):
-        st.caption("Primer ingreso: usuario **admin**, contraseña **admin123**. Cámbiala desde el menú lateral (☰).")
+    st.caption("¿Olvidaste tu contraseña? Pídele una nueva al administrador.")
+
+
+def tab_inicio(usr):
+    hoy = ahora()
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    st.markdown(f"### Bienvenido, {usr['nombre']}")
+    st.caption(f"{dias[hoy.weekday()].capitalize()} {hoy.day} de {MESES[hoy.month - 1].lower()} de {hoy.year}")
+    mm = mis_materias(usr)
+    mids = [int(i) for i in mm.id] if not mm.empty else []
+    if not mids:
+        st.info("Aún no tienes materias asignadas. Pídele al administrador que te las asigne.")
+        return
+    cl = df(f"""SELECT c.hora, m.nombre, (SELECT COUNT(*) FROM asistencia a WHERE a.clase_id=c.id) AS n
+        FROM clases c JOIN materias m ON m.id=c.materia_id WHERE c.fecha=? AND c.materia_id IN ({marcas(mids)}) ORDER BY c.hora""",
+            (str(hoy.date()), *mids))
+    st.write("**Clases de hoy**")
+    if cl.empty:
+        st.caption("No hay clases programadas para hoy. Puedes programarlas en la pestaña Calendario.")
+    for r in cl.itertuples():
+        st.write(f"{'✅' if r.n else '🕒'} {r.hora} · {r.nombre} ({'lista tomada' if r.n else 'pendiente'})")
+    sems = sorted({int(x) for x in mm.semestre})
+    n_est = q(f"SELECT COUNT(*) AS n FROM estudiantes WHERE semestre IN ({marcas(sems)})", tuple(sems))[0]["n"]
+    n_cl = q(f"SELECT COUNT(DISTINCT c.id) AS n FROM clases c WHERE c.materia_id IN ({marcas(mids)}) AND c.id IN (SELECT clase_id FROM asistencia)", tuple(mids))[0]["n"]
+    f = faltas_df(mids)
+    pct = f"{100 * f.asistencias.sum() / f.clases.sum():.1f}%" if not f.empty else "—"
+    riesgo = int(f[f.faltas > MAX_FALTAS].codigo.nunique()) if not f.empty else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Estudiantes", int(n_est))
+    m2.metric("Listas tomadas", int(n_cl))
+    m3.metric("Asistencia", pct)
+    m4.metric("En alerta", riesgo)
+    for a in alertas(mids):
+        st.error(a)
+    if not f.empty:
+        g = f.groupby("materia")[["asistencias", "clases"]].sum()
+        g["% asistencia"] = (100 * g.asistencias / g.clases).round(1)
+        st.write("**Asistencia por materia (%)**")
+        st.bar_chart(g["% asistencia"])
+    else:
+        st.caption("Cuando guardes la primera lista, aquí verás las estadísticas.")
+    if usr["rol"] == "admin":
+        st.info("💾 Recuerda descargar el respaldo en Admin → Respaldo de datos antes de cada entrega.")
 
 
 def tab_lista(usr):
@@ -332,7 +549,7 @@ def tab_lista(usr):
     if "hora0" not in st.session_state:
         st.session_state.hora0 = ahora().time().replace(second=0, microsecond=0)
     hora = c2.time_input("Hora", st.session_state.hora0)
-    roster = df("SELECT id, codigo, nombre FROM estudiantes WHERE semestre=? ORDER BY nombre", (sem,))
+    roster = df("SELECT id, codigo, nombre, foto FROM estudiantes WHERE semestre=? ORDER BY nombre", (sem,))
     if roster.empty:
         st.warning(f"No hay estudiantes registrados en semestre {sem}. El administrador debe registrarlos primero.")
         return
@@ -366,9 +583,15 @@ def tab_lista(usr):
     if r["imgs"]:
         st.write(f"✅ Reconocidos: **{len(r['presentes'])}** · ❓ Rostros sin identificar: **{r['desconocidos']}**")
     st.caption("Revisa la lista y corrige a mano lo que haga falta antes de guardar.")
-    tabla = roster.set_index("id")[["codigo", "nombre"]]
+    tabla = con_foto(roster.set_index("id")[["codigo", "nombre"]], roster["foto"])
     tabla["Presente"] = [i in r["presentes"] for i in tabla.index]
     editada = editor(tabla, f"ed_{r['n']}")
+    pres = int(editada["Presente"].sum())
+    st.info(f"Resumen antes de guardar: {pres} presentes · {len(editada) - pres} ausentes")
+    if len(editada) - pres:
+        with st.expander("Ver quiénes aparecen ausentes"):
+            for n in editada.loc[~editada["Presente"], "nombre"]:
+                st.write(f"• {n}")
     if st.button("💾 Guardar asistencia", type="primary"):
         cid = obtener_clase(mid, usr["id"], str(fecha), hora.strftime("%H:%M"))
         filas = []
@@ -442,13 +665,13 @@ def tab_corregir(usr):
         return
     op = {int(r.id): f"{r.fecha} · {r.hora}" for r in cl.itertuples()}
     cid = st.selectbox("Clase", list(op), format_func=op.get)
-    act = df("""SELECT e.id, e.codigo, e.nombre, a.presente FROM estudiantes e
+    act = df("""SELECT e.id, e.codigo, e.nombre, e.foto, a.presente FROM estudiantes e
         LEFT JOIN asistencia a ON a.estudiante_id=e.id AND a.clase_id=? WHERE e.semestre=? ORDER BY e.nombre""", (int(cid), sem))
     if act.empty:
         st.info("No hay estudiantes en este semestre.")
         return
     act["presente"] = act["presente"].fillna(0).astype(int)
-    tabla = act.set_index("id")[["codigo", "nombre"]]
+    tabla = con_foto(act.set_index("id")[["codigo", "nombre"]], act["foto"])
     tabla["Presente"] = act.set_index("id")["presente"].astype(bool)
     editada = editor(tabla, f"cor_{cid}")
     if st.button("💾 Guardar correcciones", type="primary"):
@@ -462,6 +685,14 @@ def tab_corregir(usr):
             st.error(a)
 
 
+def semaforo(tabla):
+    def color(fila):
+        n = fila["Faltas"]
+        c = "background-color:#C8E6C9;color:#1B5E20" if n <= 1 else "background-color:#FFF3C4;color:#7A5200" if n <= MAX_FALTAS else "background-color:#F8C9C9;color:#8B1A1A"
+        return [c] * len(fila)
+    return tabla.style.apply(color, axis=1, subset=["Faltas", "Estado"])
+
+
 def tab_reportes(usr):
     mm = mis_materias(usr)
     if mm.empty:
@@ -473,15 +704,51 @@ def tab_reportes(usr):
     mids = list(etq) if sel == 0 else [sel]
     for a in alertas(mids):
         st.error(a)
-    f = faltas_df(mids)
+    c1, c2 = st.columns(2)
+    buscar = c1.text_input("🔎 Buscar estudiante (nombre o código)", key="rep_b")
+    usar = c2.checkbox("Filtrar por fechas", key="rep_uf")
+    desde = hasta = None
+    if usar:
+        d1, d2 = st.columns(2)
+        desde = d1.date_input("Desde", ahora().date().replace(day=1), key="rep_d")
+        hasta = d2.date_input("Hasta", ahora().date(), key="rep_h")
+    f = faltas_df(mids, desde, hasta)
     if f.empty:
-        st.info("Todavía no hay asistencia guardada.")
+        st.info("Todavía no hay asistencia guardada" + (" en ese periodo." if usar else "."))
         return
+    if buscar.strip():
+        b = sin_tildes(buscar.strip().lower())
+        f = f[f.nombre.map(lambda x: b in sin_tildes(x.lower())) | f.codigo.str.contains(buscar.strip(), case=False, regex=False)]
+        if f.empty:
+            st.info("Ningún estudiante coincide con la búsqueda.")
+            return
     f["% asistencia"] = (100 * f.asistencias / f.clases).round(1)
+    f["Estado"] = f.faltas.map(estado_faltas)
+    tabla = f.rename(columns={"codigo": "Código", "nombre": "Estudiante", "materia": "Materia", "clases": "Clases",
+                              "asistencias": "Asistencias", "faltas": "Faltas"})[
+        ["Código", "Estudiante", "Materia", "Clases", "Asistencias", "Faltas", "% asistencia", "Estado"]]
     st.subheader("Reporte de faltas")
-    st.dataframe(f.rename(columns={"codigo": "Código", "nombre": "Estudiante", "materia": "Materia", "clases": "Clases",
-                                   "asistencias": "Asistencias", "faltas": "Faltas"}), hide_index=True)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🟢 Al día", int((f.Estado == "Al día").sum()))
+    m2.metric("🟡 En riesgo", int((f.Estado == "En riesgo").sum()))
+    m3.metric("🔴 Alerta", int((f.Estado == "Alerta").sum()))
+    try:
+        st.dataframe(semaforo(tabla), hide_index=True)
+    except Exception:
+        st.dataframe(tabla, hide_index=True)
+    st.caption(f"🟢 0 a 1 faltas · 🟡 2 a {MAX_FALTAS} faltas · 🔴 más de {MAX_FALTAS} faltas")
     st.bar_chart(f.groupby("nombre")["faltas"].sum())
+    with st.expander("🔎 Historial de un estudiante"):
+        nombres = dict(zip(f.codigo, f.nombre))
+        cod = st.selectbox("Estudiante", list(nombres), format_func=lambda c: f"{nombres[c]} ({c})", key="rep_hist")
+        h = df(f"""SELECT c.fecha, c.hora, m.nombre AS materia, CASE a.presente WHEN 1 THEN 'Presente' ELSE 'Ausente' END AS estado, a.metodo
+            FROM asistencia a JOIN clases c ON c.id=a.clase_id JOIN materias m ON m.id=c.materia_id JOIN estudiantes e ON e.id=a.estudiante_id
+            WHERE e.codigo=? AND m.id IN ({marcas(mids)}) ORDER BY c.fecha DESC, c.hora DESC""", (cod, *mids))
+        st.dataframe(h.rename(columns={"fecha": "Fecha", "hora": "Hora", "materia": "Materia", "estado": "Estado", "metodo": "Método"}), hide_index=True)
+    try:
+        st.download_button("⬇️ Reporte de faltas (PDF)", pdf_reporte(tabla, op[sel]), "reporte_faltas.pdf", "application/pdf")
+    except Exception as e:
+        st.caption(f"No se pudo generar el PDF: {e}")
     if sel == 0:
         st.caption("Elige una materia para descargar el Excel.")
         return
@@ -506,10 +773,22 @@ def tab_pensum():
 
 
 def tab_estudiantes():
-    est = df("SELECT codigo, nombre, semestre, COALESCE(LENGTH(rostros)/512, 0) AS fotos FROM estudiantes ORDER BY semestre, nombre")
+    est = df("SELECT codigo, nombre, semestre, foto, COALESCE(LENGTH(rostros)/512, 0) AS fotos FROM estudiantes ORDER BY semestre, nombre")
     st.metric("Estudiantes registrados", len(est))
     if not est.empty:
-        st.dataframe(est.rename(columns={"codigo": "Código", "nombre": "Nombre", "semestre": "Semestre", "fotos": "Fotos de rostro"}), hide_index=True)
+        buscar = st.text_input("🔎 Buscar por nombre o código", key="est_buscar")
+        ver = est
+        if buscar.strip():
+            b = sin_tildes(buscar.strip().lower())
+            ver = est[est.nombre.map(lambda x: b in sin_tildes(x.lower())) | est.codigo.str.contains(buscar.strip(), case=False, regex=False)]
+        st.dataframe(ver.drop(columns="foto").rename(columns={"codigo": "Código", "nombre": "Nombre", "semestre": "Semestre", "fotos": "Fotos de rostro"}), hide_index=True)
+        galeria = [r for r in ver.itertuples() if isinstance(r.foto, (bytes, bytearray))]
+        with st.expander("🖼️ Galería de rostros registrados"):
+            if not galeria:
+                st.caption("Aún no hay miniaturas. Se guardan al registrar un estudiante; para los registrados antes, súbeles fotos de nuevo.")
+            cols = st.columns(4)
+            for i, r in enumerate(galeria):
+                cols[i % 4].image(bytes(r.foto), caption=" ".join(r.nombre.split()[:2]), width=90)
     with st.expander("➕ Registrar estudiante o agregar fotos", expanded=est.empty):
         st.caption("Sube 2 o 3 fotos de frente, con buena luz y una sola persona. Si el código ya existe, las fotos se suman a las que ya tiene.")
         with st.form("nuevo_est", clear_on_submit=True):
@@ -518,7 +797,7 @@ def tab_estudiantes():
             sem = st.number_input("Semestre", 1, 9, 1)
             fotos = st.file_uploader("Fotos del rostro", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
             if st.form_submit_button("Guardar estudiante", type="primary"):
-                vecs, avisos = [], []
+                vecs, avisos, foto_b = [], [], None
                 for f in fotos:
                     img = leer_imagen(f)
                     caras, v = rostros(img) if img is not None else (np.zeros((0, 15)), np.zeros((0, 128)))
@@ -527,13 +806,16 @@ def tab_estudiantes():
                         continue
                     if len(v) > 1:
                         avisos.append(f"{f.name}: había {len(v)} rostros, se usó el más grande")
-                    vecs.append(v[int(np.argmax(caras[:, 2] * caras[:, 3]))])
+                    idx = int(np.argmax(caras[:, 2] * caras[:, 3]))
+                    vecs.append(v[idx])
+                    if foto_b is None:
+                        foto_b = miniatura(img, caras[idx])
                 for a in avisos:
                     st.warning(a)
                 if not codigo.strip() or not nombre.strip() or not vecs:
                     st.error("Faltan datos o ninguna foto sirvió.")
                 else:
-                    guardar_estudiante(codigo.strip(), nombre.strip(), sem, vecs)
+                    guardar_estudiante(codigo.strip(), nombre.strip(), sem, vecs, foto_b)
                     st.success(f"{nombre} guardado con {len(vecs)} foto(s).")
     if not est.empty:
         with st.expander("🗑️ Eliminar estudiante"):
@@ -668,6 +950,8 @@ if "usr" not in st.session_state:
 usr = st.session_state.usr
 es_admin = usr["rol"] == "admin"
 with st.sidebar:
+    if ESCUDO:
+        st.image(ESCUDO, width=90)
     st.write(f"👤 **{usr['nombre']}** ({usr['rol']})")
     nueva = st.text_input("Nueva contraseña", type="password")
     if st.button("Cambiar contraseña"):
@@ -679,27 +963,32 @@ with st.sidebar:
     if st.button("Cerrar sesión"):
         st.session_state.clear()
         st.rerun()
-st.title("✈️ Lista con rostro")
+estilo()
+encabezado()
+icono_pantalla_inicio()
 mids = list(etiquetas(mis_materias(usr)))
 avisos = alertas(mids)
 if avisos:
-    with st.expander(f"🚨 {len(avisos)} alerta(s): más de {MAX_FALTAS} faltas"):
-        for a in avisos:
-            st.error(a)
-nombres_tabs = ["📸 Lista", "📅 Calendario", "✏️ Corregir", "📊 Reportes", "🎓 Pensum"] + (["👥 Estudiantes", "⚙️ Admin"] if es_admin else [])
+    lineas = [a.replace("🚨 ", "• ") for a in avisos[:5]]
+    if len(avisos) > 5:
+        lineas.append(f"…y {len(avisos) - 5} más (míralos en Inicio)")
+    st.error(f"🚨 {len(avisos)} alerta(s): más de {MAX_FALTAS} faltas\n\n" + "\n\n".join(lineas))
+nombres_tabs = ["🏠 Inicio", "📸 Lista", "📅 Calendario", "✏️ Corregir", "📊 Reportes", "🎓 Pensum"] + (["👥 Estudiantes", "⚙️ Admin"] if es_admin else [])
 tabs = st.tabs(nombres_tabs)
 with tabs[0]:
-    tab_lista(usr)
+    tab_inicio(usr)
 with tabs[1]:
-    tab_calendario(usr)
+    tab_lista(usr)
 with tabs[2]:
-    tab_corregir(usr)
+    tab_calendario(usr)
 with tabs[3]:
-    tab_reportes(usr)
+    tab_corregir(usr)
 with tabs[4]:
+    tab_reportes(usr)
+with tabs[5]:
     tab_pensum()
 if es_admin:
-    with tabs[5]:
-        tab_estudiantes()
     with tabs[6]:
+        tab_estudiantes()
+    with tabs[7]:
         tab_admin()

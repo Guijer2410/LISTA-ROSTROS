@@ -3,3 +3,5 @@ opencv-python-headless
 numpy
 pandas
 openpyxl
+fpdf2
+pillow
