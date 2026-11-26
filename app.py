@@ -984,13 +984,6 @@ def tab_estudiantes():
             b = sin_tildes(buscar.strip().lower())
             ver = est[est.nombre.map(lambda x: b in sin_tildes(x.lower())) | est.codigo.str.contains(buscar.strip(), case=False, regex=False)]
         st.dataframe(ver.drop(columns="foto").rename(columns={"codigo": "Código", "nombre": "Nombre", "semestre": "Semestre", "fotos": "Fotos de rostro"}), hide_index=True)
-        galeria = [r for r in ver.itertuples() if isinstance(r.foto, (bytes, bytearray))]
-        with st.expander("🖼️ Galería de rostros registrados"):
-            if not galeria:
-                st.caption("Aún no hay miniaturas. Se guardan al registrar un estudiante; para los registrados antes, súbeles fotos de nuevo.")
-            cols = st.columns(4)
-            for i, r in enumerate(galeria):
-                cols[i % 4].image(bytes(r.foto), caption=" ".join(r.nombre.split()[:2]), width=90)
     with st.expander("➕ Registrar estudiante o agregar fotos", expanded=est.empty):
         st.caption("Sube 2 o 3 fotos de frente, con buena luz y una sola persona. Si el código ya existe, las fotos se suman a las que ya tiene.")
         with st.form("nuevo_est", clear_on_submit=True):
